@@ -45,8 +45,34 @@ FALLBACK_OUTPUT_CSV = "result_new.csv"
 DEBUG_CSV = "scan_debug.csv"
 LOG_FILE = "scan_all.log"
 CONVERTED_DIRNAME = "converted_images"
+REPORT_FILE = "pdn_report_{ts}.md"
 
 ALLOWED_TOP_DIRS = {"data", "text", "images"}
+
+# Порядок категорий в отчёте
+DETAIL_CATEGORY_ORDER = [
+    "ФИО", "Дата_рождения", "Email", "Телефон", "СНИЛС", "Адрес",
+    "Банковская_карта", "Здоровье", "ИНН", "Биометрия", "Паспорт_РФ",
+    "Банковский_счёт", "БИК", "Политика", "Национальность_раса",
+]
+
+UZ_DESCRIPTIONS = {
+    "УЗ-1": "Биометрия / спец. категории",
+    "УЗ-2": "Платёжные данные / много гос. ID",
+    "УЗ-3": "Гос. идентификаторы / много обычных ПДн",
+    "УЗ-4": "Обычные ПДн в небольшом объёме",
+}
+
+UZ_RECOMMENDATIONS = {
+    "УЗ-1": ("Спец. категории / биометрия. Требуются меры 1-го уровня защищённости "
+             "(Приказ ФСТЭК № 21). Шифрование, аттестация ИС, строгий аудит."),
+    "УЗ-2": ("Платёжные данные или гос. идентификаторы в значимом объёме. "
+             "Меры 2-го уровня защищённости. Шифрование данных, ограниченный доступ."),
+    "УЗ-3": ("Государственные идентификаторы или значимые обычные ПДн. "
+             "Меры 3-го уровня защищённости. Разграничение доступа, резервное копирование."),
+    "УЗ-4": ("Обычные ПДн. Базовые меры 4-го уровня защищённости. "
+             "Ограничение доступа, уведомление об инцидентах."),
+}
 
 MAX_TEXT_CHARS = 1_500_000
 MAX_ROWS_READ = 5_000
@@ -190,6 +216,127 @@ def has_context(text: str, idx: int, window: int, *keywords: str) -> bool:
     return any(k in chunk for k in keywords)
 
 # ============================================================
+# МАСКИРОВКА И ДЕТАЛЬНЫЕ КАТЕГОРИИ
+# ============================================================
+
+def mask_value(s: str, keep: int = 2) -> str:
+    """Маскирует строку, оставляя keep символов в начале и конце."""
+    s = s.strip()
+    n = len(s)
+    if n <= keep * 2:
+        return "*" * n
+    return s[:keep] + "*" * (n - keep * 2) + s[-keep:]
+
+def mask_context(text: str, m: "re.Match", ctx: int = 10) -> str:
+    """Показывает ctx символов до и после совпадения; само совпадение — звёздочки."""
+    s, e = m.start(), m.end()
+    before = text[max(0, s - ctx): s]
+    after  = text[e: e + ctx]
+    return (before + "*" * (e - s) + after).strip()
+
+def _kw_examples(text: str, low: str, keys: List[str], cat: str,
+                 result: Dict[str, List[str]]) -> None:
+    """Добавляет маскированный контекст для ключевых слов."""
+    seen_pos: set = set()
+    for kw in keys:
+        idx = 0
+        while True:
+            pos = low.find(kw, idx)
+            if pos == -1:
+                break
+            if pos not in seen_pos:
+                seen_pos.add(pos)
+                chunk = text[max(0, pos - 2): pos + len(kw) + 2]
+                result.setdefault(cat, []).append(mask_value(chunk, keep=2))
+            idx = pos + 1
+
+def detect_detailed_categories(text: str) -> Dict[str, List[str]]:
+    """
+    Возвращает словарь category_name → [masked_example, ...].
+    Порядок категорий: DETAIL_CATEGORY_ORDER.
+    """
+    t   = text if isinstance(text, str) else ""
+    low = t.lower()
+    result: Dict[str, List[str]] = {}
+
+    # ФИО
+    for m in FIO_RE.finditer(t):
+        val = m.group(0).strip()
+        if not is_toponym_like(val):
+            result.setdefault("ФИО", []).append(mask_value(val, keep=2))
+
+    # Дата_рождения (с контекстом)
+    for m in DOB_RE.finditer(t):
+        result.setdefault("Дата_рождения", []).append(mask_context(t, m, ctx=10))
+
+    # Email
+    for m in EMAIL_RE.finditer(t):
+        result.setdefault("Email", []).append(mask_value(m.group(0), keep=3))
+
+    # Телефон
+    for m in PHONE_RE.finditer(t):
+        result.setdefault("Телефон", []).append(mask_value(m.group(0), keep=3))
+
+    # СНИЛС
+    for m in SNILS_RE.finditer(t):
+        if snils_valid(m.group(0)):
+            result.setdefault("СНИЛС", []).append(mask_value(m.group(0), keep=3))
+
+    # Адрес (индекс с контекстом)
+    for m in INDEX_RE.finditer(t):
+        if has_context(low, m.start(), 40,
+                       "ул", "улица", "просп", "пер",
+                       "дом", "квартира", "город", "г."):
+            result.setdefault("Адрес", []).append(mask_context(t, m, ctx=10))
+
+    # ИНН
+    for m in INN12_RE.finditer(t):
+        if inn_valid(m.group(0)):
+            result.setdefault("ИНН", []).append(mask_value(m.group(0), keep=3))
+    for m in INN10_RE.finditer(t):
+        if inn_valid(m.group(0)):
+            result.setdefault("ИНН", []).append(mask_value(m.group(0), keep=3))
+
+    # Паспорт_РФ
+    for m in PASSPORT_RE.finditer(t):
+        if has_context(low, m.start(), 60,
+                       "паспорт", "серия", "номер", "код подразделения"):
+            result.setdefault("Паспорт_РФ", []).append(mask_value(m.group(0), keep=2))
+
+    # Банковская_карта
+    for m in CARD_RE.finditer(t):
+        digits = re.sub(r"\D", "", m.group(0))
+        if 13 <= len(digits) <= 19 and luhn_check(digits):
+            if has_context(low, m.start(), 40,
+                           "visa", "mastercard", "карта", "cvv", "cvc", "номер карты"):
+                result.setdefault("Банковская_карта", []).append(mask_value(m.group(0), keep=3))
+
+    # Банковский_счёт
+    for m in RS_RE.finditer(t):
+        result.setdefault("Банковский_счёт", []).append(mask_value(m.group(1), keep=3))
+
+    # БИК
+    for m in BIK_RE.finditer(t):
+        result.setdefault("БИК", []).append(mask_value(m.group(1), keep=3))
+
+    # Биометрия
+    _kw_examples(t, low, BIOMETRIC_KEYS, "Биометрия", result)
+
+    # Здоровье
+    _kw_examples(t, low,
+                 ['диагноз', 'анамнез', 'инвалид', 'здоровь', 'медицин', 'психиатр', 'вич'],
+                 "Здоровье", result)
+
+    # Политика
+    _kw_examples(t, low, ['политическ', 'партия'], "Политика", result)
+
+    # Национальность_раса
+    _kw_examples(t, low, ['религ', 'вероисповед', 'интим', 'сексуаль'],
+                 "Национальность_раса", result)
+
+    return result
+
+# ============================================================
 # СТРУКТУРЫ ДАННЫХ
 # ============================================================
 
@@ -205,6 +352,7 @@ class ScanDecision:
     doc_score: float = 0.0
     elapsed_sec: float = 0.0
     ocr_source: str = ""
+    detailed_categories: Dict[str, List[str]] = field(default_factory=dict)
 
 # ============================================================
 # ЛОГИРОВАНИЕ
@@ -265,6 +413,12 @@ def iter_candidate_files(root: Path):
     yield from sorted(data_files,  key=lambda p: p.name.lower())
     yield from sorted(text_files,  key=lambda p: p.name.lower())
     yield from sorted(image_files, key=lambda p: p.name.lower())
+
+def iter_mp4_files(root: Path):
+    """Тихо перебирает все .mp4 файлы в директории (без логирования)."""
+    for path in sorted(root.rglob("*.mp4"), key=lambda p: p.name.lower()):
+        if path.is_file():
+            yield path
 
 # ============================================================
 # ЭКСТРАКТОРЫ ТЕКСТА
@@ -669,12 +823,14 @@ def scan_one(path: Path, root: Path, converted_dir: Path,
     cats    = detect_categories(text)
     matches = extract_matches_for_debug(text)
     is_pdn, reasons, doc_score = decide(top, path, cats, text)
+    detailed = detect_detailed_categories(text) if is_pdn else {}
 
     return ScanDecision(
         path=path, top_dir=top, source_kind=kind,
         is_pdn=is_pdn, categories=cats, reasons=reasons,
         matches=matches, doc_score=doc_score,
         elapsed_sec=elapsed, ocr_source=ocr_source,
+        detailed_categories=detailed,
     )
 
 # ============================================================
@@ -720,6 +876,117 @@ def write_debug(decisions: List[ScanDecision], output_path: Path) -> None:
                     ensure_ascii=False,
                 ),
             ])
+
+# ============================================================
+# MARKDOWN-ОТЧЁТ
+# ============================================================
+
+def _fmt_examples(examples: List[str], limit: int = 3) -> str:
+    """Форматирует список примеров: первые N в backticks, остаток как (+N)."""
+    shown = examples[:limit]
+    rest  = len(examples) - len(shown)
+    parts = [f"`{e}`" for e in shown]
+    if rest > 0:
+        parts.append(f"(+{rest})")
+    return ", ".join(parts)
+
+def write_markdown_report(
+    decisions: List[ScanDecision],
+    total_files: int,
+    mp4_count: int,
+    output_path: Path,
+) -> Path:
+    """Генерирует Markdown-отчёт в стиле 152-ФЗ только по файлам с ПДн."""
+    pdn_decisions = [d for d in decisions if d.is_pdn]
+    pdn_count     = len(pdn_decisions)
+    clean_count   = total_files - pdn_count  # mp4 не считаем в scanned
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Сводка по УЗ
+    uz_counts: Dict[str, int] = {"УЗ-1": 0, "УЗ-2": 0, "УЗ-3": 0, "УЗ-4": 0}
+    for d in pdn_decisions:
+        uz = estimate_uz(d.categories)
+        if uz in uz_counts:
+            uz_counts[uz] += 1
+
+    # Суммарные находки по категориям
+    global_counts: Dict[str, int] = {}
+    for d in pdn_decisions:
+        for cat, examples in d.detailed_categories.items():
+            global_counts[cat] = global_counts.get(cat, 0) + len(examples)
+
+    lines: List[str] = []
+
+    # ── Заголовок ──────────────────────────────────────────────────────────
+    lines.append("# Отчёт сканирования персональных данных (152-ФЗ)\n")
+    lines.append(f"**Дата:** {now}  ")
+    lines.append(f"**Всего файлов:** {total_files + mp4_count}  ")
+    lines.append(f"**С ПДн:** {pdn_count}  ")
+    lines.append(f"**Без ПДн:** {clean_count}")
+    lines.append("")
+
+    # ── Сводка по УЗ ───────────────────────────────────────────────────────
+    lines.append("## Сводка по уровням защищённости\n")
+    lines.append("| УЗ | Файлов | Описание |")
+    lines.append("|----|-------|----------|")
+    for uz, desc in UZ_DESCRIPTIONS.items():
+        lines.append(f"| {uz} | {uz_counts[uz]} | {desc} |")
+    lines.append(f"| — | {clean_count} | ПДн не обнаружены |")
+    lines.append("")
+
+    # ── Суммарные категории ────────────────────────────────────────────────
+    if global_counts:
+        lines.append("## Категории ПДн (суммарно по всем файлам)\n")
+        lines.append("| Категория | Находок |")
+        lines.append("|-----------|--------:|")
+        for cat in DETAIL_CATEGORY_ORDER:
+            cnt = global_counts.get(cat, 0)
+            if cnt:
+                lines.append(f"| {cat} | {cnt} |")
+        lines.append("")
+
+    # ── Файлы с ПДн ────────────────────────────────────────────────────────
+    if pdn_decisions:
+        lines.append("## Файлы с обнаруженными ПДн\n")
+
+    for d in pdn_decisions:
+        uz   = estimate_uz(d.categories)
+        ext  = d.path.suffix.upper().lstrip(".")
+        try:
+            size = d.path.stat().st_size
+            size_str = f"{size:,} байт"
+        except Exception:
+            size_str = "н/д"
+
+        total_matches = sum(len(v) for v in d.detailed_categories.values())
+
+        lines.append(f"### `{d.path}`")
+        lines.append(f"- Формат: {ext} · Размер: {size_str}")
+        lines.append(f"- **УЗ: {uz}** · Находок: {total_matches}")
+
+        cat_lines = []
+        for cat in DETAIL_CATEGORY_ORDER:
+            examples = d.detailed_categories.get(cat)
+            if not examples:
+                continue
+            cnt      = len(examples)
+            ex_str   = _fmt_examples(examples, limit=3)
+            cat_lines.append(f"  - {cat}: {cnt} экз — {ex_str}")
+
+        if cat_lines:
+            lines.append("- Категории:")
+            lines.extend(cat_lines)
+
+        rec = UZ_RECOMMENDATIONS.get(uz, "")
+        if rec:
+            lines.append(f"- Рекомендация: {rec}")
+        lines.append("")
+
+    report_text = "\n".join(lines)
+    output_path.write_text(report_text, encoding="utf-8")
+    return output_path
+
 
 # ============================================================
 # MAIN
@@ -779,15 +1046,32 @@ def main() -> None:
                 st = path.stat()
                 rows.append((st.st_size, fmt_mtime(st.st_mtime), path.name))
 
+        # MP4: добавляем в result без какого-либо логирования
+        for mp4_path in iter_mp4_files(root):
+            if mp4_path.name not in seen_names:
+                seen_names.add(mp4_path.name)
+                st = mp4_path.stat()
+                rows.append((st.st_size, fmt_mtime(st.st_mtime), mp4_path.name))
+
+        mp4_count = sum(1 for _ in iter_mp4_files(root))
+
         rows.sort(key=lambda x: x[2].lower())
 
         out = write_result(rows, root / OUTPUT_CSV)
         write_debug(decisions, root / DEBUG_CSV)
 
+        # Markdown-отчёт — только по файлам с ПДн
+        ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_name = REPORT_FILE.format(ts=ts)
+        report_path = write_markdown_report(
+            decisions, total, mp4_count, root / report_name
+        )
+
         elapsed_all = time.time() - started_all
         log("", lf)
         log(f"result  → {out}", lf)
         log(f"debug   → {root / DEBUG_CSV}", lf)
+        log(f"report  → {report_path}", lf)
         log(f"log     → {log_path}", lf)
         log(f"PDN files found : {len(rows)}", lf)
         log(f"Total time      : {elapsed_all:.2f}s", lf)
