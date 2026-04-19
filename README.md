@@ -1,193 +1,375 @@
-# XaXaTon
+# XaXaTon — Комплексное решение для анализа ПДн в файловом хранилище
 
-# ПДн-Сканер — поиск персональных данных в файловом хранилище
+Данный репозиторий содержит два взаимодополняющих скрипта для работы с датасетом файлов и поиска персональных данных.
 
-Решение задачи по обнаружению персональных данных (152-ФЗ) в корпоративном файловом хранилище.
+## 📦 Состав решения
 
-## Описание решения
+| Скрипт | Назначение |
+|--------|------------|
+| `organize_by_real_format_recursive.py` | Реорганизация файлов по их реальному формату (определение по магическим байтам) |
+| `scan.py` / `Reshenie.py` | Сканирование файлов на наличие персональных данных (ПДн) |
 
-Скрипт `Reshenie.py` сканирует директорию с файлами и находит все файлы, содержащие персональные данные. Результат сохраняется в `result.csv` в формате `size,time,name`.
+---
+
+## 🔄 Общий пайплайн работы
+
+```
+Исходный датасет (беспорядочная структура)
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│  ШАГ 1: organize_by_real_format_recursive.py  │
+│  - Рекурсивный обход всех подпапок             │
+│  - Определение реального формата по magic bytes│
+│  - Сортировка файлов по папкам:               │
+│    pdf/, images/, office/, text/, data/ и т.д.│
+└───────────────────────────────────────────────┘
+        │
+        ▼
+Организованная структура (плоская, по типам)
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│  ШАГ 2: scan.py / Reshenie.py                 │
+│  - Сканирование папок data/, text/, images/   │
+│  - Извлечение текста (OCR для изображений)    │
+│  - Поиск паттернов ПДн (email, телефон, ФИО,  │
+│    СНИЛС, ИНН, паспорт, биометрия и др.)      │
+│  - Классификация по уровням защищённости (УЗ) │
+└───────────────────────────────────────────────┘
+        │
+        ▼
+result.csv + детальные отчёты
+```
+
+---
+
+## 🛠️ Скрипт 1: Организатор датасета
+
+### Назначение
+
+Приводит хаотичную структуру файлов к единообразному виду, сортируя файлы по **реальному формату** (определяемому по магическим байтам, а не по расширению).
+
+### Поддерживаемые форматы
+
+| Реальный формат | Целевая папка | Расширения |
+|----------------|---------------|-------------|
+| PDF | `pdf/` | .pdf |
+| ZIP/DOCX/XLSX | `archives/` | .zip, .docx, .xlsx, .pptx |
+| OLE2 (DOC/XLS/PPT) | `office/` | .doc, .xls, .ppt |
+| RTF | `office/` | .rtf |
+| Изображения | `images/` | .png, .jpg, .jpeg, .gif, .bmp, .tif, .tiff |
+| Видео | `video/` | .mp4, .avi, .ogv |
+| HTML | `html/` | .html, .htm |
+| XML/JSON/CSV | `data/` | .xml, .json, .csv, .parquet |
+| Текст | `text/` | .txt, .md, .rst, .log |
+| SQLite | `sqlite/` | .sqlite, .db |
+
+### Особенности
+
+- **Обнаружение подмен** — файл с расширением `.jpg`, но реально являющийся HTML, будет перемещён в `html/` с предупреждением
+- **Извлечение архивов** — опционально распаковывает ZIP-архивы
+- **Защита от коллизий** — автоматическое переименование при совпадении имён
+- **Dry-run режим** — просмотр планируемых действий без изменений
+
+### Запуск
+
+```bash
+# Показать, что будет сделано (без реальных изменений)
+python organize_by_real_format_recursive.py /path/to/dataset --dry-run
+
+# Реально переместить файлы (внутри исходной директории)
+python organize_by_real_format_recursive.py /path/to/dataset --mode move
+
+# Скопировать в новую структуру (сохраняя оригиналы)
+python organize_by_real_format_recursive.py /path/to/dataset --mode copy --output /new/location
+
+# Извлечь ZIP-архивы в процессе
+python organize_by_real_format_recursive.py /path/to/dataset --mode move --extract-archives
+
+# Сохранить отчёт в JSON
+python organize_by_real_format_recursive.py /path/to/dataset --mode move --report report.json
+
+# Верифицировать уже организованную структуру
+python organize_by_real_format_recursive.py /path/to/organized --verify
+```
+
+### Параметры
+
+| Параметр | Описание |
+|----------|----------|
+| `--mode` | `move` (переместить), `copy` (скопировать), `symlink` (симлинки) |
+| `--output` | Целевая директория (для copy/symlink) |
+| `--dry-run` | Только показать, что будет сделано |
+| `--extract-archives` | Извлекать ZIP-архивы |
+| `--no-unknown` | Не перемещать файлы с неопределённым форматом |
+| `--verify` | Верифицировать уже организованную структуру |
+| `--report` | Сохранить отчёт в JSON |
+
+---
+
+## 🔍 Скрипт 2: Сканер персональных данных
+
+### Назначение
+
+Сканирует организованную структуру (папки `data/`, `text/`, `images/`) и находит файлы, содержащие персональные данные (в соответствии с 152-ФЗ).
 
 ### Что обнаруживается
 
 | Категория | Примеры |
 |-----------|---------|
-| ФИО | Русские и латинские имена, поля surname/given name в ID-картах |
-| Email | любой@домен.ru |
-| Телефоны | +7, 8, международные (+420, +49, ...) |
-| Дата рождения | Русский, английский, чешский, немецкий языки |
-| Паспорт РФ | Серия + номер, MRZ-строки |
-| СНИЛС / ИНН | С контекстным словом или разделителями |
-| Международные документы | Document no, ID card, Czech obcanský průkaz |
-| Банковские карты | Проверка алгоритмом Луна, CVV, БИК, счета |
-| Адреса | Российский формат (г. Москва, ул. Ленина, д. 1) |
-| Биометрия | Упоминания отпечатков, сетчатки, распознавания лиц |
-| Медданные | Диагнозы, МКБ-10, история болезни |
+| **Обычные ПДн** | |
+| ФИО (русские) | Иванов Иван Иванович |
+| Email | user@example.com |
+| Телефоны | +7(123)456-78-90, 89123456789 |
+| Дата рождения | 12.05.1985 |
+| Адрес (с контекстом) | г. Москва, ул. Ленина, д. 1 |
+| **Государственные идентификаторы** | |
+| СНИЛС | 123-456-789 01 |
+| ИНН (10 или 12 цифр) | 123456789012 |
+| Паспорт РФ | 1234 567890 |
+| MRZ (машиночитаемая зона) | P<RUSIVANOV<<IVAN... |
+| Водительское удостоверение | 10-12 цифр с контекстом |
+| **Платёжные данные** | |
+| Банковские карты (с проверкой Луна) | 4111 1111 1111 1111 |
+| Расчётный счёт | 20 цифр с контекстом "р/с" |
+| БИК | 9 цифр с контекстом "бик" |
+| **Биометрия** | отпечатки пальцев, радужка, лицо, селфи |
+| **Специальные категории** | здоровье, диагнозы, религия, политические взгляды |
 
 ### Поддерживаемые форматы
 
-**Текст / структура (фаза 1, CPU-параллельно):**
-PDF, DOCX, DOC, RTF, TXT, MD, HTML, XML, CSV, TSV, JSON, JSONL, XLSX, XLS, Parquet, SQLite, ZIP, GZIP
+| Папка | Форматы | Способ извлечения |
+|-------|---------|-------------------|
+| `data/` | .csv, .parquet | Прямое чтение (первые 5000 строк) |
+| `text/` | .txt | Чтение с автоопределением кодировки |
+| `images/` | .tif, .tiff | OCR (Tesseract + предобработка OpenCV) |
 
-**OCR — изображения (фаза 2, GPU):**
-TIF, TIFF, JPG, JPEG, PNG, GIF, BMP
+### Уровни защищённости (УЗ)
 
-**OCR — видео (фаза 2, GPU):**
-MP4, AVI, MOV (сэмплирование кадров каждые 2-5 сек)
+На основе обнаруженных категорий скрипт присваивает уровень защищённости:
 
-### Архитектура
+| Уровень | Критерии |
+|---------|----------|
+| **УЗ-1** | Специальные категории ИЛИ биометрия (при достаточном количестве) |
+| **УЗ-2** | Платёжные данные ИЛИ гос. идентификаторы |
+| **УЗ-3** | Обычные ПДн (ФИО, email, телефон) |
+| **УЗ-4** | Незначительные признаки или единичные совпадения |
+| **нет признаков** | ПДн не обнаружены |
 
-```
-Датасет
-   │
-   ├─► Фаза 1: CPU ProcessPool (16 воркеров)
-   │     PDF/DOCX/HTML/CSV/... → извлечение текста → regex ПДн
-   │     PDF без текстового слоя → pending_ocr → фаза 2
-   │
-   └─► Фаза 2: OCR GPU (1 воркер, EasyOCR)
-         Предобработка: TIF→JPEG (~500кб), PDF deflate-сжатие
-         EasyOCR GPU → текст → regex ПДн
-         Зависшие файлы → очередь повтора (таймаут ×3)
-
-Checkpoint: results.jsonl (построчно, resume при падении)
-Выход: result.csv + детальные отчёты CSV/JSON/Markdown
-```
-
----
-
-## Установка
-
-### 1. Создать виртуальное окружение
+### Запуск
 
 ```bash
-python -m venv venv_pdn
-# Windows:
-venv_pdn\Scripts\activate
-# Linux/Mac:
-source venv_pdn/bin/activate
+# Базовый запуск с указанием корневой папки
+python scan.py "C:\path\to\organized\share"
+
+# С указанием пути к Tesseract (Windows)
+python scan.py "C:\path\to\share" "C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# Если папка называется data/text/images (стандартная структура)
+python scan.py
 ```
 
-### 2. Установить зависимости
-
-```bash
-pip install pandas pdfplumber "pdfminer.six" PyPDF2 python-docx \
-            beautifulsoup4 lxml openpyxl xlrd pyarrow chardet \
-            docx2txt pytesseract Pillow olefile pymupdf \
-            python-magic-bin opencv-python easyocr
-```
-
-### 3. Установить PyTorch с поддержкой CUDA (для GPU)
-
-```bash
-# CUDA 12.8 (RTX 40xx / 50xx):
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-
-# CUDA 12.6:
-pip install torch --index-url https://download.pytorch.org/whl/cu126
-```
-
-### 4. Установить Tesseract OCR (резервный движок)
-
-**Windows:** https://github.com/UB-Mannheim/tesseract/wiki  
-⚠️ При установке обязательно выбрать пакет языка **Russian**
-
-**Linux:**
-```bash
-sudo apt install tesseract-ocr tesseract-ocr-rus
-```
-
----
-
-## Запуск
-
-### Основная команда
-
-```bash
-python Reshenie.py /path/to/dataset
-```
-
-### С GPU-ускорением (рекомендуется)
-
-```bash
-python Reshenie.py /path/to/dataset --ocr-engine easyocr --gpu-batch-size 16
-```
-
-### Продолжить прерванный скан
-
-```bash
-python Reshenie.py /path/to/dataset --resume
-```
-
-### Только текстовые файлы (без OCR изображений)
-
-```bash
-python Reshenie.py /path/to/dataset --no-ocr
-```
-
-### Все параметры
+### Структура, ожидаемая скриптом
 
 ```
-python Reshenie.py --help
-
-Positional:
-  directory                   Путь к директории с датасетом
-
-Optional:
-  --workers N                 CPU-воркеры для фазы 1 (по умолч: число ядер)
-  --ocr-workers N             OCR-воркеры для фазы 2 (по умолч: 2)
-  --ocr-engine ENGINE         auto | easyocr | tesseract | none
-  --gpu-batch-size N          Батч EasyOCR (по умолч: 8; рекоменд: 16-32)
-  --no-ocr                    Пропустить OCR
-  --resume                    Продолжить с чекпоинта
-  --out-dir DIR               Директория для отчётов (по умолч: ./pdn_reports)
-  --result-csv FILE           Путь к result.csv (по умолч: ./result.csv)
-  --submission-name-mode      basename | relative (по умолч: basename)
+share/                    ← корневая папка (передаётся как аргумент)
+├── data/                 ← CSV и Parquet файлы
+│   ├── customers.csv
+│   ├── logistics.csv
+│   └── *.parquet
+├── text/                 ← TXT файлы
+│   ├── anketa.txt
+│   └── *.txt
+├── images/               ← TIF/TIFF изображения
+│   ├── scan_001.tif
+│   └── *.tiff
+└── converted_images/     ← создаётся автоматически (JPG-копии для OCR)
 ```
 
----
+**Важно:** Скрипт сканирует **только** папки `data/`, `text/`, `images/`. Другие папки (например, `pdf/`, `html/`, `office/`) игнорируются.
 
-## Выходные файлы
+### Выходные файлы
 
-```
-result.csv                      ← Файл для сдачи (size, time, name)
-pdn_reports/
-    pdn_report_TIMESTAMP.csv    ← Детальный отчёт со всеми находками
-    pdn_report_TIMESTAMP.json   ← То же в JSON
-    pdn_report_TIMESTAMP.md     ← Markdown с примерами совпадений
-    results.jsonl               ← Чекпоинт (для --resume)
-```
+| Файл | Содержание |
+|------|------------|
+| `result.csv` | Итоговый файл для сдачи (size, time, name) |
+| `result_new.csv` | Альтернативный результат (если основной занят) |
+| `scan_debug.csv` | Детальный отладка по каждому файлу (УЗ, найденные совпадения) |
+| `scan_all.log` | Полный лог процесса сканирования |
+| `converted_images/` | Папка с JPG-копиями TIF-файлов |
 
 ### Формат result.csv
 
 ```csv
 size,time,name
 3068287,sep 26 18:31,CA01_01.tif
-24983,sep 26 12:08,anketa.docx
+24983,sep 26 12:08,anketa_dms.txt
+156234,sep 25 09:15,customers.csv
 ```
 
 - `size` — размер файла в байтах
-- `time` — дата модификации (`mon dd HH:MM`, строчные, день без ведущего нуля)
+- `time` — дата модификации (формат: `месяц день часы:минуты`, строчные буквы)
 - `name` — имя файла (basename)
 
 ---
 
-## Производительность
+## 🚀 Полный рабочий процесс
 
-Тестировалось на датасете ~3300 файлов (2.2 ГБ):
+### Шаг 1: Реорганизация датасета
 
-| Фаза | Движок | Скорость |
-|------|--------|----------|
-| Фаза 1 (текст) | 16 CPU воркеров | ~65 файл/с |
-| Фаза 2 (OCR) | EasyOCR + RTX 5060 Ti | ~3-4 файл/с |
-| Итого | | ~5-7 минут |
+```bash
+# Перейти в директорию с исходным датасетом
+cd C:\PyProject\XaXaTon\ПДнDataset
+
+# Посмотреть, что будет перемещено
+python organize_by_real_format_recursive.py share --dry-run
+
+# Выполнить реорганизацию (перемещение файлов)
+python organize_by_real_format_recursive.py share --mode move
+```
+
+После этого структура `share/` будет выглядеть так:
+```
+share/
+├── pdf/          (1466 файлов)
+├── html/         (706 файлов)
+├── images/       (977 файлов)  ← TIF/JPG/PNG/GIF/BMP
+├── office/       (61 файл)
+├── data/         (19 файлов)   ← CSV/Parquet/JSON
+├── text/         (20 файлов)   ← TXT/MD/LOG
+├── archives/     (63 файла)
+├── binary/       (8 файлов)
+├── video/        (3 файла)
+└── sqlite/       (0 файлов)
+```
+
+### Шаг 2: Сканирование ПДн
+
+```bash
+# Запустить сканирование (обрабатывает data/, text/, images/)
+python scan.py share
+
+# Или с указанием полного пути
+python scan.py "C:\PyProject\XaXaTon\ПДнDataset\share"
+```
+
+### Шаг 3: Получение результатов
+
+```bash
+# Результат для сдачи
+cat share/result.csv
+
+# Детальный отладка (для анализа)
+cat share/scan_debug.csv
+
+# Лог выполнения
+cat share/scan_all.log
+```
 
 ---
 
-## Метрика
+## ⚠️ Важные замечания
+
+### Почему scan.py видит не все файлы?
+
+Скрипт `scan.py` **намеренно ограничен** и обрабатывает только:
+- `data/*.csv` и `data/*.parquet`
+- `text/*.txt`
+- `images/*.tif` и `images/*.tiff`
+
+Если после реорганизации в папке `share/` есть `pdf/`, `html/`, `office/` и другие — они **не будут просканированы**, потому что:
+1. Скрипт не умеет извлекать текст из PDF/DOC/HTML
+2. Это было вне scope хакатона (основной фокус — CSV, TXT, TIF)
+
+### Как расширить сканирование на все файлы?
+
+1. **Изменить `ALLOWED_TOP_DIRS`** в `scan.py`:
+```python
+ALLOWED_TOP_DIRS = {"data", "text", "images", "pdf", "html", "office"}
+```
+
+2. **Добавить обработчики** для новых форматов (например, `extract_from_pdf()`)
+
+3. **Использовать `Reshenie.py`** (более полная версия, поддерживающая PDF, DOCX, и другие форматы)
+
+---
+
+## 📊 Пример вывода
+
+### Лог сканирования
 
 ```
-Score = (TP - 0.1 × FP) / (TP + FN)
+ROOT          : C:\PyProject\...\share
+TESSERACT     : C:\Program Files\Tesseract-OCR\tesseract.exe
+TOTAL FILES   : 40
+
+[1/40] data/client.parquet
+    PDN kind=parquet uz=УЗ-2 score=0.00 t=0.56s matches={"EMAIL": 2999, "PHONE": 9}
+[12/40] text/anketa_dms.txt
+    PDN kind=txt uz=УЗ-1 score=1.40 t=0.00s matches={"EMAIL": 2, "PHONE": 2, "SNILS": 1, "FIO_RU": 5}
+[23/40] images/CA01_01.tif
+    PDN kind=image uz=УЗ-2 score=0.80 t=23.85s ocr=converted_jpg matches={"PHONE": 1}
+
+PDN files found : 22
+Total time      : 376.42s
 ```
 
-Стратегия: при K=0.1 пропуск реального файла с ПДн (FN) в 10 раз дороже
-ложного срабатывания (FP), поэтому пороги детекции настроены на высокий recall.
+### Результат (result.csv)
+
+```csv
+size,time,name
+24983,sep 26 12:08,anketa_dms.txt
+3068287,sep 26 18:31,CA01_01.tif
+156234,sep 25 09:15,customers.csv
+```
+
+---
+
+## 📁 Структура проекта
+
+```
+XaXaTon/
+├── organize_by_real_format_recursive.py   # Организатор файлов
+├── scan.py                                 # Сканер ПДн (упрощённый)
+├── Reshenie.py                             # Сканер ПДн (полная версия)
+├── structure.py                            # Вывод структуры папок
+├── share/                                  # Датасет
+│   ├── data/                               # CSV/Parquet файлы
+│   ├── text/                               # TXT файлы
+│   ├── images/                             # TIF/TIFF файлы
+│   ├── converted_images/                   # JPG-копии (создаётся автоматически)
+│   ├── result.csv                          # ← результат сканирования
+│   ├── scan_debug.csv                      # ← отладка
+│   └── scan_all.log                        # ← лог
+└── pdn_reports/                            # Детальные отчёты (для Reshenie.py)
+```
+
+---
+
+## 🔧 Требования
+
+- Python 3.8+
+- Tesseract OCR (с русским языком)
+- Для `organize_by_real_format_recursive.py`: стандартная библиотека + `python-magic-bin` (опционально)
+- Для `scan.py`: `pytesseract`, `opencv-python`, `Pillow`, `pandas`, `numpy`
+
+Установка зависимостей:
+
+```bash
+pip install pandas opencv-python pillow pytesseract numpy
+```
+
+---
+
+## 📝 Резюме
+
+| Скрипт | Что делает | Что на входе | Что на выходе |
+|--------|------------|--------------|----------------|
+| `organize_by_real_format_recursive.py` | Сортирует файлы по реальному формату | Любая структура | Плоская структура `тип/файлы` |
+| `scan.py` | Ищет ПДн в структурированном датасете | `data/`, `text/`, `images/` | `result.csv` + отчёты |
+
+**Рекомендуемый порядок использования:**
+1. Запустить `organize_by_real_format_recursive.py` для приведения датасета в порядок
+2. Запустить `scan.py` для поиска ПДн в организованной структуре
+3. Сдать `result.csv` как финальный результат
